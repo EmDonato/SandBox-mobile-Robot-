@@ -12,7 +12,9 @@ This project is a **simulation sandbox** for experimenting with several aspects 
 The goal is to provide a modular framework where algorithms can be tested together in a controlled environment.
 
 ---
-
+| |
+|:--:|
+|![Simulator screenshot](img/1757842809611.png)|
 ## Project Structure
 
 * `environment.py` → Grid-based world, obstacles, inflated occupancy grid, and drawing utilities.
