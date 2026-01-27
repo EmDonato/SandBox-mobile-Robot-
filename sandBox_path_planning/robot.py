@@ -13,7 +13,7 @@ class Motor:
     """
 
     def __init__(self, kp=1.0, ki=0.5, kd=0.0):
-        self.A = 0.2
+        self.A = 1.0
         self.B = 1.0
         self.C = 1.0
         self.x = 0.0  # internal state (velocity)
@@ -33,7 +33,7 @@ class Motor:
         u = self.pid.compute(error, dt)  # PID control action
         self.x = self.A * self.x + self.B * u
         # Return measured velocity with Gaussian noise
-        return self.C * self.x + np.random.normal(0, 0.001)
+        return self.C * self.x 
 
 
 class Robot:
@@ -42,13 +42,15 @@ class Robot:
     Units are expressed in grid cells for simplicity.
     """
 
-    def __init__(self, x, y, theta=0.0, radius=1.6, wheel_base=3.6,
+    def __init__(self, x, y, theta=0.0, radius=1.2, wheel_base=2.4,
                  kp=1.0, ki=0.2, kd=0.0):
         # State (pose)
         self.x = float(x)
         self.y = float(y)
+        self.x_gps = float(x)
+        self.y_gps = float(y)
         self.theta = float(theta)
-
+        self.bias = 0.0017
         # Geometry
         self.radius = float(radius)          # robot radius [cells]
         self.wheel_base = float(wheel_base)  # wheel separation [cells]
@@ -57,13 +59,21 @@ class Robot:
         self.v_cmd = 0.0  # linear velocity
         self.w_cmd = 0.0  # angular velocity
 
+
         # Independent motors (each with its own PID)
         self.mL = Motor(kp, ki, kd)
         self.mR = Motor(kp, ki, kd)
 
-        # Noisy measurements (simulate GPS-like measurements)
-        self.x_meas = 0.0
-        self.y_meas = 0.0
+        #encoders comulative
+        self.vL_enc_ = 0.0
+        self.vR_enc_ = 0.0
+        #imu
+        self.bias_ = 0.0017
+        self.yaw_rate_ = 0.0
+        self.a_ = 0.0001
+        self.w_true_ = 0.0  # angular velocity
+
+
 
     def step(self, dt, vdes, wdes):
         """
@@ -78,27 +88,61 @@ class Robot:
         VRdes = vdes + wdes * (self.wheel_base / 2.0)
 
         # Motor evolution with internal PID control
-        vL = self.mL.step(Vldes, dt)
-        vR = self.mR.step(VRdes, dt)
-
+        vL = self.mL.step(Vldes, dt) 
+        vR = self.mR.step(VRdes, dt) 
+        self.w_true_ = (vR - vL) / self.wheel_base
+        vL = vL + np.random.normal(0, 0.05)
+        vR = vR + np.random.normal(0, 0.05)
         # Effective robot velocities
         self.v_cmd = (vL + vR) / 2.0
         self.w_cmd = (vR - vL) / self.wheel_base
 
-        # Update robot pose (with process noise)
-        self.x += self.v_cmd * math.cos(self.theta) * dt + np.random.normal(0, 0.05)
-        self.y += self.v_cmd * math.sin(self.theta) * dt + np.random.normal(0, 0.05)
-        self.theta += self.w_cmd * dt + np.random.normal(0, 0.05)
+        # Update robot pose realpose
+        self.x += self.v_cmd * math.cos(self.theta) * dt 
+        self.y += self.v_cmd * math.sin(self.theta) * dt 
+        self.theta += self.w_cmd * dt
+
+        #gps
+        self.x_gps = self.x + np.random.normal(0, 0.05)
+        self.y_gps = self.y + np.random.normal(0, 0.05)
+         
+        #enc
+        self.upload_enc_(vL, vR)
+
+        #imu
+        self.upload_imu_(self.w_true_, dt)
+
 
         # GPS-like noisy measurements
-        self.x_meas = self.x + np.random.normal(0, 0.025)
-        self.y_meas = self.y + np.random.normal(0, 0.025)
+        #self.x_meas = self.x + np.random.normal(0, 0.025)
+        #self.y_meas = self.y + np.random.normal(0, 0.025)
 
         # Normalize theta in [-pi, pi]
         if self.theta > math.pi:
             self.theta -= 2.0 * math.pi
         elif self.theta < -math.pi:
             self.theta += 2.0 * math.pi
+    def upload_enc_(self, vel_left, vel_right):
+        self.vL_enc_ += vel_left
+        self.vR_enc_ += vel_right 
+
+    def get_enc(self, N):
+            # Calcola il risultato prima di resettare!
+            res_L = self.vL_enc_ / N
+            res_R = self.vR_enc_ / N
+            
+            # Ora resetta gli accumulatori per i prossimi N campioni
+            self.vL_enc_ = 0.0
+            self.vR_enc_ = 0.0
+            
+            return res_L, res_R
+    def upload_bias_(self, dt):
+        self.bias_ = self.bias_  + self.a_*dt
+
+    def upload_imu_(self, w, dt):
+        self.yaw_rate_ = w + self.bias_+ np.random.normal(0, 0.025)
+        self.upload_bias_(dt)
+
 
     def collides_with_env(self, env):
         """

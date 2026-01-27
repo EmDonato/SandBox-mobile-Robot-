@@ -1,74 +1,111 @@
-import sympy as sp
 import numpy as np
+import math
+
+def normalize_angle(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 class Kalman:
-    """
-    Extended Kalman Filter (EKF) for differential-drive robot.
-    State vector: [x, y, theta, vL, vR]^T
-    Measurement:  [x_meas, y_meas, vL_meas, vR_meas]^T
-    """
-
-    def __init__(self, L=3.6, dt=0.1, xx=0.0, yy=0.0):
-        self.L = L
+    def __init__(self, dt, N, robot, a_coeff=0.0001):
         self.dt = dt
+        self.N = N
+        self.robot = robot
+        self.a = a_coeff
+        self.i = 0
+        self.j = 0
+        self.N_gps = N * 5  
 
-        # Symbolic variables
-        x, y, theta, vL, vR, dt, L = sp.symbols('x y theta vL vR dt L')
-
-        # Kinematic model
-        x_next     = x + (vL + vR)/2 * sp.cos(theta) * dt
-        y_next     = y + (vL + vR)/2 * sp.sin(theta) * dt
-        theta_next = theta + (vR - vL)/L * dt
-        vL_next    = vL
-        vR_next    = vR
-
-        f = sp.Matrix([x_next, y_next, theta_next, vL_next, vR_next])
-        X = sp.Matrix([x, y, theta, vL, vR])
-
-        # Jacobian
-        Fsym = f.jacobian(X)
-
-        # Numeric functions
-        self.f_func = sp.lambdify((x, y, theta, vL, vR, dt, L), f, "numpy")
-        self.F_func = sp.lambdify((x, y, theta, vL, vR, dt, L), Fsym, "numpy")
-
-        # Initial state
-        self.x_hat = np.zeros((5,1))
-        self.x_hat[0] = xx
-        self.x_hat[1] = yy
-        self.P = np.eye(5) * 0.1
-
-        # Covariances (consistent with robot noise)
-        self.Q = np.diag([0.0025, 0.0025, 0.0025, 0.01, 0.01])
-        self.R = np.diag([0.00625, 0.00625, 0.001, 0.001])
-
-        # Observation matrix
-        self.H = np.array([
-            [1,0,0,0,0],
-            [0,1,0,0,0],
-            [0,0,0,1,0],
-            [0,0,0,0,1]
+        # State: [x, y, theta, omega, bias] actually we know bias
+        self.X = np.array([
+            [robot.x],
+            [robot.y],
+            [robot.theta],
+            [0.0],          
+            [0.0001]        
         ])
 
-    def predict(self):
-        """Prediction step."""
-        x, y, theta, vL, vR = self.x_hat.flatten()
-        self.x_hat = np.array(
-            self.f_func(x, y, theta, vL, vR, self.dt, self.L),
-            dtype=float
-        ).reshape(5,1)
-        Fk = np.array(self.F_func(x, y, theta, vL, vR, self.dt, self.L), dtype=float)
-        self.P = Fk @ self.P @ Fk.T + self.Q
+        self.P = np.eye(5) * 1e-2
+        self.Q = np.diag([1e-3, 1e-3, 1e-3, 1e-3, 1e-5]) #Uncetancy model and encoders
+        self.R_imu = np.array([[0.025**2]]) #Uncetancy IMU Theta
+        self.R_gps = np.diag([0.05**2, 0.05**2]) #Uncetancy GPS  X e Y
 
-    def update(self, z):
-        """Update step with measurement z = [x_meas, y_meas, vL_meas, vR_meas]."""
-        z = np.array(z).reshape(-1,1)
-        z_hat = self.H @ self.x_hat
-        y_tilde = z - z_hat
-        S = self.H @ self.P @ self.H.T + self.R
-        K = self.P @ self.H.T @ np.linalg.inv(S)
+    def run(self):
+        
+        self.update_imu(self.robot.yaw_rate_)#fast update with imu
 
-        # Update
-        self.x_hat = self.x_hat + K @ y_tilde
-        I = np.eye(5)
-        self.P = (I - K @ self.H) @ self.P
+        #prediction with encoder 100hz
+        self.i = (self.i + 1) % self.N
+        if self.i == 0:
+            dt_enc = self.dt * self.N
+            vl, vr = self.robot.get_enc(self.N)
+            v_enc = (vl + vr) / 2.0
+            w_enc = (vr - vl) / self.robot.wheel_base
+            self.predict_encoder(v_enc, w_enc, dt_enc)
+
+        # sloooooow update: GPS 165hz
+        self.j = (self.j + 1) % self.N_gps
+        if self.j == 0:
+            self.update_gps()
+
+    def predict_encoder(self, v, w_enc, dt):
+        x, y, theta, omega, bias = self.X.flatten()
+
+        # state Update 
+        self.X[0, 0] = x + v * math.cos(theta) * dt
+        self.X[1, 0] = y + v * math.sin(theta) * dt
+        self.X[2, 0] = normalize_angle(theta + w_enc * dt)
+        self.X[3, 0] = w_enc 
+        self.X[4, 0] = bias + self.a * dt
+
+        # Jacobian F
+        F = np.eye(5)
+        F[0, 2] = -v * math.sin(theta) * dt
+        F[1, 2] =  v * math.cos(theta) * dt
+        F[2, 3] = dt 
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update_imu(self, z_gyro):
+        z = np.array([[z_gyro]])
+        h = self.X[3, 0] + self.X[4, 0] # omega + bias
+        H = np.array([[0, 0, 0, 1, 1]])
+
+        y_err = z - h
+        S = H @ self.P @ H.T + self.R_imu
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.X = self.X + K @ y_err
+        self.X[2, 0] = normalize_angle(self.X[2, 0])
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    def update_gps(self):
+        # [x_gps, y_gps]
+        z = np.array([[self.robot.x_gps], 
+                      [self.robot.y_gps]])
+        
+        # h(x) = [x, y] 
+        h = self.X[0:2]
+        
+        
+        H = np.array([
+            [1, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0]
+        ])
+
+        y_err = z - h
+        
+        S = H @ self.P @ H.T + self.R_gps
+        K = self.P @ H.T @ np.linalg.inv(S)
+
+        self.X = self.X + K @ y_err
+        self.P = (np.eye(5) - K @ H) @ self.P
+
+    def draw(self, canvas, cell_px, tag="kalman_odom"): #our belive
+        S = cell_px
+        x, y, theta = self.X[0,0], self.X[1,0], self.X[2,0]
+        cx, cy = x * S, y * S
+        rpx = self.robot.radius * S
+
+        canvas.delete(tag)
+        canvas.create_oval(cx-rpx, cy-rpx, cx+rpx, cy+rpx, outline="red", width=2, tags=tag)
+        hx = cx + rpx * math.cos(theta)
+        hy = cy + rpx * math.sin(theta)
+        canvas.create_line(cx, cy, hx, hy, fill="red", width=2, tags=tag)

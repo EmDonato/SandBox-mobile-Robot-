@@ -1,10 +1,12 @@
 import tkinter as tk
 import math
+import numpy as np
 
+# --- Import modules ---
 from environment import Environment
-from pathFinding import *
+from pathFinding import astar, rollout
 from robot import Robot
-from control import *   # rollout + purePursuit
+from control import purePursuit
 from kalman import Kalman
 
 # --- Global state ---
@@ -12,260 +14,167 @@ start = None
 goal = None
 traj = None
 mobileRobot = None
-ekf = None             # EKF filter instance
-
-L = 1.0                # lookahead distance
-lookahead_idx = 0
+ekf = None
+path = None
 running = False
-show = False
+show_grid = False
 velRef = 1.0
+L = 3.0                
+lookahead_idx = 0
 
-# PID gains
-kp = 0.0
-ki = 0.0
-kd = 0.0
+# PID Initial Gains
+kp, ki, kd = 1.0, 0.2, 0.01
 
+# ------------------------- GUI Callbacks -------------------------
 
-# ------------------------- GUI callbacks -------------------------
+def reset_simulation():
+    global start, goal, traj, mobileRobot, ekf, lookahead_idx, running, path
+    running = False
+    start = goal = traj = mobileRobot = ekf = path = None
+    lookahead_idx = 0
+    canvas.delete("all")
+    env.draw(canvas, show_expanded=False, tag="env")
+    print("Reset complete.")
+
 def on_clickPosition(event):
-    """Select start and goal with two mouse clicks."""
-    global start, goal, mobileRobot, kp, ki, kd, ekf
-
-    cx = event.x // env.cell_px
-    cy = event.y // env.cell_px
-    cell = (cx, cy)
-
+    global start, goal, mobileRobot, ekf, traj, lookahead_idx, running, path
+    cx, cy = event.x // env.cell_px, event.y // env.cell_px
+    
     if start is None:
-        # First click → start
-        start = cell
-        x0, y0 = start
-
-        mobileRobot = Robot(x0 + 0.5, y0 + 0.5, theta=0.0,
-                            kp=kp, ki=ki, kd=kd)
-
-        canvas.create_oval(
-            (cx + 0.5) * env.cell_px - 5,
-            (cy + 0.5) * env.cell_px - 5,
-            (cx + 0.5) * env.cell_px + 5,
-            (cy + 0.5) * env.cell_px + 5,
-            fill="green", outline=""
-        )
-
-        # EKF initialized with starting pose
-        ekf = Kalman(L=3.6, dt=0.1, xx=x0+0.5, yy=y0+0.5)
-        print("Start:", start)
-
-    elif goal is None:
-        # Second click → goal
-        goal = cell
-        canvas.create_oval(
-            (cx + 0.5) * env.cell_px - 5,
-            (cy + 0.5) * env.cell_px - 5,
-            (cx + 0.5) * env.cell_px + 5,
-            (cy + 0.5) * env.cell_px + 5,
-            fill="red", outline=""
-        )
-        print("Goal:", goal)
-
-
-def on_slide(value):
-    global L
-    L = float(value)
-
-
-def on_slideVel(value):
-    global velRef
-    velRef = float(value)
-
-
-def on_slidekp(value):
-    global kp, mobileRobot
-    kp = float(value)
-    if mobileRobot:
-        mobileRobot.mL.pid.kp = kp
-        mobileRobot.mR.pid.kp = kp
-
-
-def on_slideki(value):
-    global ki, mobileRobot
-    ki = float(value)
-    if mobileRobot:
-        mobileRobot.mL.pid.ki = ki
-        mobileRobot.mR.pid.ki = ki
-
-
-def on_slidekd(value):
-    global kd, mobileRobot
-    kd = float(value)
-    if mobileRobot:
-        mobileRobot.mL.pid.kd = kd
-        mobileRobot.mR.pid.kd = kd
-
+        start = (cx, cy)
+        mobileRobot = Robot(cx, cy, theta=0.0, kp=kp, ki=ki, kd=kd)
+        ekf = Kalman(dt=0.033, N=3, robot=mobileRobot)
+        canvas.create_oval(cx*10-5, cy*10-5, cx*10+5, cy*10+5, fill="green", tags="start")
+        print(f"Start: {start}")
+    else:
+        goal = (cx, cy)
+        canvas.delete("goal")
+        canvas.create_oval(cx*10-5, cy*10-5, cx*10+5, cy*10+5, fill="red", tags="goal")
+        
+        if running:
+            # Dynamic re-planning during execution
+            curr_est_pos = (int(ekf.X[0,0]), int(ekf.X[1,0]))
+            new_path = astar(env, curr_est_pos, goal, diagonals=True)
+            if new_path:
+                path = new_path
+                canvas.delete("path")
+                canvas.delete("start")
+                draw_path(canvas, path, env.cell_px)
+                traj = rollout(path, velRef, 0.1)
+                lookahead_idx = 0
+                print("Path updated while running.")
 
 def on_clickshow():
-    global show
-    show = not show
+    global show_grid
+    show_grid = not show_grid
+    canvas.delete("env")
+    env.draw(canvas, show_expanded=show_grid, tag="env")
+    canvas.tag_lower("env")
 
+# --- Sliders Callbacks ---
+def on_slideVel(v): global velRef; velRef = float(v)
+def on_slideL(v):   global L; L = float(v)
+def on_slidekp(v):  
+    global kp, mobileRobot; kp = float(v)
+    if mobileRobot: mobileRobot.mL.pid.kp = mobileRobot.mR.pid.kp = kp
+def on_slideki(v):  
+    global ki, mobileRobot; ki = float(v)
+    if mobileRobot: mobileRobot.mL.pid.ki = mobileRobot.mR.pid.ki = ki
+def on_slidekd(v):  
+    global kd, mobileRobot; kd = float(v)
+    if mobileRobot: mobileRobot.mL.pid.kd = mobileRobot.mR.pid.kd = kd
 
-# ------------------------- Simulation functions -------------------------
-def draw_path(canvas, path, cell_px, color="#1976d2"):
-    """Draw the planned path on the canvas."""
-    if not path or len(path) < 2:
-        return
-    for i in range(len(path) - 1):
-        x0, y0 = path[i]
-        x1, y1 = path[i + 1]
-        px0 = (x0 + 0.5) * cell_px
-        py0 = (y0 + 0.5) * cell_px
-        px1 = (x1 + 0.5) * cell_px
-        py1 = (y1 + 0.5) * cell_px
-        canvas.create_line(px0, py0, px1, py1, width=2, fill=color)
+# ------------------------- Logic -------------------------
 
+def draw_path(canvas, path_coords, cell_px):
+    if not path_coords: return
+    for i in range(len(path_coords)-1):
+        x0, y0 = path_coords[i]; x1, y1 = path_coords[i+1]
+        canvas.create_line(x0*cell_px, y0*cell_px, x1*cell_px, y1*cell_px, 
+                           width=2, fill="#1976d2", tags="path")
 
-def find_lookahead_point(path, est_x, est_y, L):
-    """Find the lookahead point using EKF-estimated position."""
+def find_lookahead_point(current_traj, est_x, est_y, look_dist):
     global lookahead_idx
-    for i in range(lookahead_idx, len(path)):
-        px, py = path[i]
-        dx = px - est_x
-        dy = py - est_y
-        if math.hypot(dx, dy) >= L:
+    for i in range(lookahead_idx, len(current_traj)):
+        px, py = current_traj[i]
+        if math.hypot(px - est_x, py - est_y) >= look_dist:
             lookahead_idx = i
             return px, py
-    lookahead_idx = len(path) - 1
-    return path[-1]
-
+    return current_traj[-1]
 
 def step():
-    """One simulation step."""
-    global traj, running, show, velRef, ekf
-
-    if not running or traj is None:
-        return
-    if mobileRobot.collides_with_env(env):
-        print("Collision detected")
-        running = False
-        return
-
-    v_des = velRef
-    dt = 0.1
-
-    # --- EKF state estimate ---
-    est_x, est_y, est_theta, est_vL, est_vR = ekf.x_hat.flatten()
-
-    # Find lookahead point
+    global traj, running, ekf, mobileRobot, lookahead_idx
+    if not running or traj is None or ekf is None: return
+    
+    dt = 0.033
+    est_x, est_y, est_theta = ekf.X[0,0], ekf.X[1,0], ekf.X[2,0]
     tx, ty = find_lookahead_point(traj, est_x, est_y, L)
+    
+    est_state = type("State", (), {"x": est_x, "y": est_y, "theta": est_theta})()
+    vdes, wdes = purePursuit(velRef, L, est_state, [(tx, ty)])
 
-    # Draw lookahead point
-    canvas.delete("lookahead")
-    S = env.cell_px
-    canvas.create_oval(
-        (tx + 0.5) * S - 3, (ty + 0.5) * S - 3,
-        (tx + 0.5) * S + 3, (ty + 0.5) * S + 3,
-        fill="red", outline="", tags="lookahead"
-    )
-
-    # --- Controller (uses EKF estimate, not true state) ---
-    vdes, wdes = purePursuit(v_des, L, type("dummy", (), {
-        "x": est_x, "y": est_y, "theta": est_theta
-    })(), [(tx, ty)])
-
-    # Update true robot dynamics
     mobileRobot.step(dt, vdes, wdes)
+    ekf.run()
 
-    # --- EKF update ---
-    ekf.predict()
-    ekf.update([
-        mobileRobot.x_meas,   # noisy GPS-like x
-        mobileRobot.y_meas,   # noisy GPS-like y
-        mobileRobot.mL.x,     # left wheel state
-        mobileRobot.mR.x      # right wheel state
-    ])
-
-    # Draw environment and robot
-    canvas.delete("env")
-    env.draw(canvas, show_expanded=show, tag="env")
-
-    canvas.delete("robot")
+    S = env.cell_px
+    canvas.delete("lookahead", "robot", "kalman_odom")
+    canvas.create_oval(tx*S-3, ty*S-3, tx*S+3, ty*S+3, fill="orange", tags="lookahead")
     mobileRobot.draw(canvas, env, tag="robot")
+    ekf.draw(canvas, S, tag="kalman_odom")
 
-    # --- Arrival condition (use estimated state) ---
-    dx = est_x - goal[0]
-    dy = est_y - goal[1]
-    if math.hypot(dx, dy) <= 1.5:
-        print("Arrived at goal")
-        running = False
-        return
+    if mobileRobot.collides_with_env(env):
+        print("Collision!"); running = False
+    
+    if math.hypot(est_x - goal[0], est_y - goal[1]) <= 1.5:
+        print("Goal reached!"); running = False
 
-    root.after(int(dt * 1000), step)
-
+    if running: root.after(33, step)
 
 def start_simulation():
-    """Plan path and start simulation."""
-    global traj, running
+    global traj, running, lookahead_idx, path, start
+    if start is None or goal is None: return
+    s_pos = (int(ekf.X[0,0]), int(ekf.X[1,0])) if ekf else start
+    path = astar(env, s_pos, goal, diagonals=True)
+    if path:
+        canvas.delete("path")
+        draw_path(canvas, path, env.cell_px)
+        traj = rollout(path, velRef, 0.1)
+        lookahead_idx = 0
+        if not running:
+            running = True; step()
 
-    if start is None or goal is None:
-        print("Please select start and goal first!")
-        return
+# ------------------------- Main -------------------------
 
-    # Path planning
-    path = astar(env, start, goal, diagonals=True)
-    print("Path found:", len(path), "nodes")
-    draw_path(canvas, path, env.cell_px)
-
-    # Rollout trajectory
-    v_des = 1.0
-    dt = 0.1
-    traj = rollout(path, v_des, dt)
-    print("Trajectory resampled:", len(traj), "points")
-
-    # Draw robot
-    mobileRobot.draw(canvas, env, tag="robot")
-
-    # Start simulation
-    running = True
-    step()
-
-
-# ------------------------- Main GUI -------------------------
 def main():
     global env, canvas, root
-
-    env = Environment(width_cells=80, height_cells=56, cell_px=10)
-    env.set_inflate(3)
-
+    env = Environment(width_cells=100, height_cells=80, cell_px=10)
+    env.set_inflate(2.7)#add padding
+    
     root = tk.Tk()
-    root.title("A* + Pure Pursuit + EKF demo")
+    root.title("SANDBOX MOBILE ROBOT")
 
-    Wpx = env.width_cells * env.cell_px
-    Hpx = env.height_cells * env.cell_px
-    canvas = tk.Canvas(root, width=Wpx, height=Hpx, bg="#fafafa")
+    canvas = tk.Canvas(root, width=1000, height=800, bg="#ffffff")
     canvas.pack()
-
-    # Draw environment
-    env.draw(canvas, show_expanded=False, tag="env")
-
-    # Bind mouse click
+    env.draw(canvas, tag="env")
     canvas.bind("<Button-1>", on_clickPosition)
 
+    # UI Panel
+    ui = tk.Frame(root)
+    ui.pack(fill="x", padx=10, pady=5)
+    
     # Sliders
-    tk.Scale(root, from_=0.5, to=5.0, resolution=0.1,
-             orient="horizontal", command=on_slideVel, label="Velocity").pack(side="left")
-    tk.Scale(root, from_=0.5, to=5.0, resolution=0.1,
-             orient="horizontal", command=on_slide, label="Lookahead").pack(side="left")
-    tk.Scale(root, from_=0.0, to=1.5, resolution=0.1,
-             orient="horizontal", command=on_slidekp, label="Kp").pack(side="left")
-    tk.Scale(root, from_=0.0, to=2.0, resolution=0.1,
-             orient="horizontal", command=on_slideki, label="Ki").pack(side="left")
-    tk.Scale(root, from_=0.0, to=0.1, resolution=0.001,
-             orient="horizontal", command=on_slidekd, label="Kd").pack(side="left")
-
+    tk.Scale(ui, from_=0.5, to=5.0, resolution=0.1, orient="horizontal", command=on_slideVel, label="Vel").pack(side="left")
+    tk.Scale(ui, from_=0.5, to=8.0, resolution=0.1, orient="horizontal", command=on_slideL, label="L").pack(side="left")
+    tk.Scale(ui, from_=0.0, to=2.0, resolution=0.05, orient="horizontal", command=on_slidekp, label="Kp").pack(side="left")
+    tk.Scale(ui, from_=0.0, to=2.0, resolution=0.05, orient="horizontal", command=on_slideki, label="Ki").pack(side="left")
+    tk.Scale(ui, from_=0.0, to=0.5, resolution=0.01, orient="horizontal", command=on_slidekd, label="Kd").pack(side="left")
+    
     # Buttons
-    tk.Button(root, text="Start", command=start_simulation).pack(side="right")
-    tk.Button(root, text="Show Occupy Grid", command=on_clickshow).pack(side="right")
+    tk.Button(ui, text="START", bg="#2e7d32", fg="white", command=start_simulation, width=10).pack(side="right", padx=5)
+    tk.Button(ui, text="RESET", bg="#d32f2f", fg="white", command=reset_simulation, width=10).pack(side="right", padx=5)
+    tk.Button(ui, text="GRID", command=on_clickshow).pack(side="right", padx=5)
 
     root.mainloop()
-
 
 if __name__ == "__main__":
     main()
