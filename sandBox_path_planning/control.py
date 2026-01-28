@@ -4,22 +4,23 @@ import math
 def purePursuit(v_des, L, robot, path):
     """
     Pure Pursuit controller for trajectory tracking.
-    
+
+    The controller assumes that the robot follows a circular arc that:
+    - starts at the robot position,
+    - is tangent to the robot heading,
+    - passes through a lookahead point on the path.
+
+    The curvature of this arc is computed geometrically and converted
+    into an angular velocity command.
+
     Args:
         v_des (float): Desired linear velocity [m/s].
         L (float): Lookahead distance [m].
-        robot (object): Object with attributes (x, y, theta) representing
-                        the robot's current pose.
-        path (list of tuple): List of target points [(x, y), ...].
-                              The first point is the current target.
-    
+        robot (object): Robot pose with attributes (x, y, theta).
+        path (list of tuple): Reference path points [(x, y), ...].
+
     Returns:
-        (float, float): Linear velocity (v) and angular velocity (w).
-    
-    Notes:
-        - The Pure Pursuit algorithm computes a curvature towards a
-          lookahead point on the path.
-        - If no path is available, the function returns (0.0, robot.theta).
+        (float, float): Linear velocity v and angular velocity w.
     """
     if not path:
         return 0.0, robot.theta  # No target available
